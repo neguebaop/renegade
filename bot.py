@@ -158,21 +158,29 @@ class PanelSelect(discord.ui.Select):
     async def callback(self, interaction:discord.Interaction):
         if self.values[0]=='none':
             await interaction.response.send_message('Nenhum produto neste painel ainda.', ephemeral=True); return
+        # Responde rápido para o Discord não derrubar a interação em hospedagem lenta
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await start_order(interaction, int(self.values[0]))
+
+async def smart_send(interaction: discord.Interaction, *args, **kwargs):
+    # Se a interação já recebeu defer(), usa followup. Senão, responde normal.
+    if interaction.response.is_done():
+        return await interaction.followup.send(*args, **kwargs)
+    return await interaction.response.send_message(*args, **kwargs)
 
 async def start_order(interaction:discord.Interaction, product_id:int):
     con=db(); p=con.execute('SELECT * FROM products WHERE id=?',(product_id,)).fetchone()
     if not p:
-        con.close(); await interaction.response.send_message('❌ Produto não encontrado.', ephemeral=True); return
+        con.close(); await smart_send(interaction, '❌ Produto não encontrado.', ephemeral=True); return
     if p['stock']==0:
-        con.close(); await interaction.response.send_message('❌ Produto sem estoque.', ephemeral=True); return
+        con.close(); await smart_send(interaction, '❌ Produto sem estoque.', ephemeral=True); return
     code=random_code()
     con.execute('INSERT INTO orders(guild_id,user_id,product_id,product_name,amount,code) VALUES(?,?,?,?,?,?)',(interaction.guild.id, interaction.user.id, product_id, p['name'], p['price'], code))
     con.commit(); oid=con.execute('SELECT last_insert_rowid()').fetchone()[0]; con.close()
     cfg=get_config(interaction.guild.id)
     pix_key = cfg['pix_key'] or PIX_KEY
     if not pix_key:
-        await interaction.response.send_message('❌ PIX ainda não configurado. Use /autenticacao ou /configurar.', ephemeral=True); return
+        await smart_send(interaction, '❌ PIX ainda não configurado. Use /autenticacao ou /configurar.', ephemeral=True); return
     payload = pix_payload(pix_key, cfg['pix_name'] or PIX_NOME, cfg['pix_city'] or PIX_CIDADE, p['price'], code)
     qr=make_qr_bytes(payload); file=discord.File(qr, filename='pix.png')
     embed=discord.Embed(title=f'💎 Pedido #{oid} - {p["name"]}', description='Pague usando o QR Code ou copia e cola abaixo.', color=0x00a86b)
@@ -180,7 +188,7 @@ async def start_order(interaction:discord.Interaction, product_id:int):
     embed.add_field(name='🔑 Código', value=code, inline=True)
     embed.add_field(name='📋 PIX copia e cola', value=f'```{payload[:900]}```', inline=False)
     embed.set_image(url='attachment://pix.png')
-    await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
+    await smart_send(interaction, embed=embed, file=file, ephemeral=True)
     await log(interaction.guild, f'🛒 Novo pedido #{oid}: {interaction.user.mention} comprou **{p["name"]}** por {money(p["price"])}')
 
 # ================= EMBEDS =================
@@ -304,30 +312,24 @@ async def criar_ticket(interaction: discord.Interaction, tipo: str):
 async def on_ready():
     init_db()
 
-    # ================= PERSISTENT VIEWS =================
-    # Corrige dropdown/botões falharem depois que o bot reinicia.
-    try:
-        bot.add_view(TicketPanelView())
-        bot.add_view(CloseTicketView())
-    except Exception as e:
-        print('Erro registrando views de ticket:', e)
-
+    # Persistent views: mantém botões/dropdowns funcionando após reiniciar o bot.
+    # Isso restaura todos os painéis salvos no vendas.db.
+    bot.add_view(TicketPanelView())
+    bot.add_view(CloseTicketView())
     try:
         con = db()
-        panels = con.execute('SELECT id FROM panels').fetchall()
+        paineis = con.execute('SELECT id FROM panels').fetchall()
         con.close()
-        for panel in panels:
+        for painel in paineis:
             try:
-                bot.add_view(PanelOnlyView(int(panel['id'])))
-                print(f'View persistente restaurada para painel {panel["id"]}')
+                bot.add_view(PanelOnlyView(int(painel['id'])))
             except Exception as e:
-                print('Erro restaurando painel persistente:', panel['id'], e)
+                print('erro restaurando painel', painel['id'], e)
+        print(f'Views persistentes restauradas: {len(paineis)} painel(is)')
     except Exception as e:
-        print('Erro lendo painéis para persistent views:', e)
+        print('Erro restaurando views persistentes:', e)
 
-    for g in bot.guilds:
-        ensure_config(g.id)
-
+    for g in bot.guilds: ensure_config(g.id)
     try:
         global_synced = await bot.tree.sync()
         total=0
@@ -473,47 +475,20 @@ async def estatisticas(interaction):
 
 @bot.tree.command(name='conectar', description='Conecta o bot em um canal de voz')
 async def conectar(interaction, canal:Optional[discord.VoiceChannel]=None):
+    # Defer imediato evita Unknown interaction quando a conexão de voz demora.
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         canal = canal or (interaction.user.voice.channel if interaction.user.voice else None)
         if not canal:
-            await interaction.followup.send('❌ Entre em uma call ou escolha um canal de voz no comando.', ephemeral=True)
+            await interaction.followup.send('❌ Entre em uma call ou escolha um canal.', ephemeral=True)
             return
-
-        perms = canal.permissions_for(interaction.guild.me)
-        if not perms.view_channel or not perms.connect:
-            await interaction.followup.send('❌ Eu não tenho permissão para ver/conectar nesse canal.', ephemeral=True)
-            return
-
-        vc = interaction.guild.voice_client
-        if vc and vc.is_connected():
-            try:
-                await vc.move_to(canal)
-                await interaction.followup.send(f'✅ Movido/conectado em {canal.mention}', ephemeral=True)
-                return
-            except Exception:
-                try:
-                    await vc.disconnect(force=True)
-                except Exception:
-                    pass
-
-        await asyncio.sleep(1)
-
-        try:
-            await canal.connect(timeout=35, reconnect=False, self_deaf=True)
-            await interaction.followup.send(f'✅ Conectado em {canal.mention}', ephemeral=True)
-        except asyncio.TimeoutError:
-            await interaction.followup.send('❌ Timeout ao conectar na call. Mude a região do canal para Automático/Brasil e tente novamente.', ephemeral=True)
-        except discord.errors.ClientException as e:
-            await interaction.followup.send(f'❌ Erro de cliente de voz: `{e}`', ephemeral=True)
-        except Exception as e:
-            await interaction.followup.send(f'❌ Erro ao conectar: `{e}`', ephemeral=True)
-
+        if interaction.guild.voice_client:
+            await interaction.guild.voice_client.move_to(canal)
+        else:
+            await canal.connect(timeout=30, reconnect=True, self_deaf=True)
+        await interaction.followup.send(f'✅ Conectado em {canal.mention}', ephemeral=True)
     except Exception as e:
-        try:
-            await interaction.followup.send(f'❌ Erro geral ao conectar: `{e}`', ephemeral=True)
-        except Exception:
-            pass
+        await interaction.followup.send(f'❌ Erro ao conectar: `{e}`', ephemeral=True)
 
 @bot.tree.command(name='desconectar', description='Desconecta do canal de voz')
 async def desconectar(interaction):
@@ -521,23 +496,6 @@ async def desconectar(interaction):
         if interaction.guild.voice_client: await interaction.guild.voice_client.disconnect(force=True); await interaction.response.send_message('✅ Desconectado.', ephemeral=True)
         else: await interaction.response.send_message('❌ Não estou em call.', ephemeral=True)
     except Exception as e: await interaction.response.send_message(f'❌ Erro: `{e}`', ephemeral=True)
-
-@bot.tree.command(name='verificar-audio', description='Verifica bibliotecas necessárias para call/voz')
-async def verificar_audio(interaction):
-    status = []
-    try:
-        import nacl  # noqa
-        status.append('✅ PyNaCl instalado')
-    except Exception:
-        status.append('❌ PyNaCl não instalado: use `pip install PyNaCl`')
-    try:
-        import audioop  # noqa
-        status.append('✅ audioop disponível')
-    except Exception:
-        status.append('❌ audioop indisponível: use Python 3.11 no Render/runtime.txt')
-    vc = interaction.guild.voice_client
-    status.append(f'🎧 Voice client: `{bool(vc and vc.is_connected())}`')
-    await interaction.response.send_message('\n'.join(status), ephemeral=True)
 
 @bot.tree.command(name='painel-ticket', description='Envia painel de ticket com imagem opcional')
 @app_commands.describe(titulo='Título do painel', descricao='Descrição do painel', imagem='URL da imagem/banner')
