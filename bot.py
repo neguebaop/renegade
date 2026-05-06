@@ -127,38 +127,15 @@ async def log(guild:discord.Guild, msg:str):
 
 # ================= UI VENDAS =================
 class BuyView(discord.ui.View):
-    # View persistente: o custom_id guarda o ID do produto.
-    # Assim, depois que o bot reinicia, o botão continua funcionando.
     def __init__(self, product_id:int=None, panel_id:int=None):
         super().__init__(timeout=None)
-        self.product_id = product_id
-        self.panel_id = panel_id
-        if panel_id:
-            self.add_item(PanelSelect(panel_id))
-        if product_id:
-            self.add_item(ProductBuyButton(product_id))
-        elif not panel_id:
-            self.add_item(ProductBuyButton(None))
+        self.product_id=product_id; self.panel_id=panel_id
+        if panel_id: self.add_item(PanelSelect(panel_id))
 
-class ProductBuyButton(discord.ui.Button):
-    def __init__(self, product_id:Optional[int]=None):
-        custom = f'buy_product_{product_id}' if product_id else 'buy_single_product_empty'
-        super().__init__(label='🛒 Comprar agora', style=discord.ButtonStyle.green, custom_id=custom)
-        self.product_id = product_id
-
-    async def callback(self, interaction:discord.Interaction):
-        pid = self.product_id
-        # Segurança extra: se a view foi restaurada pelo custom_id, extrai o ID do botão.
-        try:
-            cid = getattr(self, 'custom_id', '') or ''
-            if not pid and cid.startswith('buy_product_'):
-                pid = int(cid.replace('buy_product_', ''))
-        except Exception:
-            pass
-        if pid:
-            await start_order(interaction, int(pid))
-        else:
-            await interaction.response.send_message('Selecione um produto no menu abaixo.', ephemeral=True)
+    @discord.ui.button(label='🛒 Comprar agora', style=discord.ButtonStyle.green, custom_id='buy_single_product')
+    async def buy_btn(self, interaction:discord.Interaction, button:discord.ui.Button):
+        if self.product_id: await start_order(interaction, self.product_id)
+        else: await interaction.response.send_message('Selecione um produto no menu abaixo.', ephemeral=True)
 
 class PanelOnlyView(discord.ui.View):
     def __init__(self, panel_id:int):
@@ -328,35 +305,25 @@ async def on_ready():
     init_db()
 
     # ================= PERSISTENT VIEWS =================
-    # Isso é o que mantém dropdowns/botões funcionando após reiniciar o bot.
-    # Os produtos e painéis ficam no vendas.db; aqui o bot registra novamente as interações.
+    # Corrige dropdown/botões falharem depois que o bot reinicia.
     try:
         bot.add_view(TicketPanelView())
         bot.add_view(CloseTicketView())
     except Exception as e:
-        print('erro registrando views ticket:', e)
+        print('Erro registrando views de ticket:', e)
 
     try:
         con = db()
-        panel_rows = con.execute('SELECT id FROM panels').fetchall()
-        product_rows = con.execute('SELECT id FROM products WHERE active=1').fetchall()
+        panels = con.execute('SELECT id FROM panels').fetchall()
         con.close()
-
-        for painel in panel_rows:
+        for panel in panels:
             try:
-                bot.add_view(PanelOnlyView(int(painel['id'])))
+                bot.add_view(PanelOnlyView(int(panel['id'])))
+                print(f'View persistente restaurada para painel {panel["id"]}')
             except Exception as e:
-                print('erro registrando painel', painel['id'], e)
-
-        for produto in product_rows:
-            try:
-                bot.add_view(BuyView(product_id=int(produto['id'])))
-            except Exception as e:
-                print('erro registrando produto', produto['id'], e)
-
-        print(f'Views restauradas: {len(panel_rows)} painéis | {len(product_rows)} produtos')
+                print('Erro restaurando painel persistente:', panel['id'], e)
     except Exception as e:
-        print('erro restaurando views persistentes:', e)
+        print('Erro lendo painéis para persistent views:', e)
 
     for g in bot.guilds:
         ensure_config(g.id)
@@ -506,15 +473,47 @@ async def estatisticas(interaction):
 
 @bot.tree.command(name='conectar', description='Conecta o bot em um canal de voz')
 async def conectar(interaction, canal:Optional[discord.VoiceChannel]=None):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         canal = canal or (interaction.user.voice.channel if interaction.user.voice else None)
-        if not canal: await interaction.followup.send('❌ Entre em uma call ou escolha um canal.', ephemeral=True); return
-        if interaction.guild.voice_client: await interaction.guild.voice_client.move_to(canal)
-        else: await canal.connect(timeout=20, reconnect=True)
-        await interaction.followup.send(f'✅ Conectado em {canal.mention}', ephemeral=True)
+        if not canal:
+            await interaction.followup.send('❌ Entre em uma call ou escolha um canal de voz no comando.', ephemeral=True)
+            return
+
+        perms = canal.permissions_for(interaction.guild.me)
+        if not perms.view_channel or not perms.connect:
+            await interaction.followup.send('❌ Eu não tenho permissão para ver/conectar nesse canal.', ephemeral=True)
+            return
+
+        vc = interaction.guild.voice_client
+        if vc and vc.is_connected():
+            try:
+                await vc.move_to(canal)
+                await interaction.followup.send(f'✅ Movido/conectado em {canal.mention}', ephemeral=True)
+                return
+            except Exception:
+                try:
+                    await vc.disconnect(force=True)
+                except Exception:
+                    pass
+
+        await asyncio.sleep(1)
+
+        try:
+            await canal.connect(timeout=35, reconnect=False, self_deaf=True)
+            await interaction.followup.send(f'✅ Conectado em {canal.mention}', ephemeral=True)
+        except asyncio.TimeoutError:
+            await interaction.followup.send('❌ Timeout ao conectar na call. Mude a região do canal para Automático/Brasil e tente novamente.', ephemeral=True)
+        except discord.errors.ClientException as e:
+            await interaction.followup.send(f'❌ Erro de cliente de voz: `{e}`', ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f'❌ Erro ao conectar: `{e}`', ephemeral=True)
+
     except Exception as e:
-        await interaction.followup.send(f'❌ Erro ao conectar: `{e}`', ephemeral=True)
+        try:
+            await interaction.followup.send(f'❌ Erro geral ao conectar: `{e}`', ephemeral=True)
+        except Exception:
+            pass
 
 @bot.tree.command(name='desconectar', description='Desconecta do canal de voz')
 async def desconectar(interaction):
@@ -522,6 +521,23 @@ async def desconectar(interaction):
         if interaction.guild.voice_client: await interaction.guild.voice_client.disconnect(force=True); await interaction.response.send_message('✅ Desconectado.', ephemeral=True)
         else: await interaction.response.send_message('❌ Não estou em call.', ephemeral=True)
     except Exception as e: await interaction.response.send_message(f'❌ Erro: `{e}`', ephemeral=True)
+
+@bot.tree.command(name='verificar-audio', description='Verifica bibliotecas necessárias para call/voz')
+async def verificar_audio(interaction):
+    status = []
+    try:
+        import nacl  # noqa
+        status.append('✅ PyNaCl instalado')
+    except Exception:
+        status.append('❌ PyNaCl não instalado: use `pip install PyNaCl`')
+    try:
+        import audioop  # noqa
+        status.append('✅ audioop disponível')
+    except Exception:
+        status.append('❌ audioop indisponível: use Python 3.11 no Render/runtime.txt')
+    vc = interaction.guild.voice_client
+    status.append(f'🎧 Voice client: `{bool(vc and vc.is_connected())}`')
+    await interaction.response.send_message('\n'.join(status), ephemeral=True)
 
 @bot.tree.command(name='painel-ticket', description='Envia painel de ticket com imagem opcional')
 @app_commands.describe(titulo='Título do painel', descricao='Descrição do painel', imagem='URL da imagem/banner')
