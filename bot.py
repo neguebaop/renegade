@@ -7,6 +7,23 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 import qrcode
+from flask import Flask
+from threading import Thread
+import os
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot online!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = Thread(target=run_web)
+    t.start()
 
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -572,5 +589,6 @@ async def desbloquear(interaction):
 async def restaurar_servidor(interaction):
     if not await admin_only(interaction): return
     ensure_config(interaction.guild.id); await interaction.response.send_message('✅ Dados restaurados/sincronizados no banco.', ephemeral=True)
+keep_alive()
 
 bot.run(TOKEN)
