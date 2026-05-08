@@ -589,6 +589,7 @@ async def desbloquear(interaction):
 async def restaurar_servidor(interaction):
     if not await admin_only(interaction): return
     ensure_config(interaction.guild.id); await interaction.response.send_message('✅ Dados restaurados/sincronizados no banco.', ephemeral=True)
-keep_alive()
 
+
+keep_alive()
 bot.run(TOKEN)
