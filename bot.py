@@ -99,7 +99,8 @@ def init_db():
     # Migração segura para versões antigas do banco
     for col, typ in [
         ('image_url','TEXT DEFAULT ""'), ('banner_url','TEXT DEFAULT ""'), ('delivery_text','TEXT DEFAULT ""'),
-        ('category','TEXT DEFAULT "Produtos"'), ('active','INTEGER DEFAULT 1')
+        ('category','TEXT DEFAULT "Produtos"'), ('active','INTEGER DEFAULT 1'),
+        ('channel_id','INTEGER'), ('message_id','INTEGER')
     ]:
         add_column_if_missing(cur, 'products', col, typ)
     for col, typ in [('image_url','TEXT DEFAULT ""'), ('banner_url','TEXT DEFAULT ""'), ('topic_id','INTEGER'), ('color','INTEGER DEFAULT 5793266')]:
@@ -342,32 +343,73 @@ async def on_ready():
     init_db()
 
     # Persistent views: mantém botões/dropdowns funcionando após reiniciar o bot.
-    # Isso restaura todos os painéis salvos no vendas.db.
+    # Além de registrar as views, este bloco RELIGA as mensagens antigas com msg.edit(view=...).
     bot.add_view(TicketPanelView())
     bot.add_view(CloseTicketView())
+
+    restored_panels = 0
+    republished_panels = 0
+    restored_products = 0
+    republished_products = 0
+
     try:
         con = db()
-        paineis = con.execute('SELECT id FROM panels').fetchall()
-        produtos = con.execute('SELECT id FROM products WHERE active=1').fetchall()
+        paineis = con.execute('SELECT * FROM panels').fetchall()
+        produtos = con.execute('SELECT * FROM products WHERE active=1').fetchall()
         con.close()
 
+        # 1) Restaura e RELIGA painéis publicados com /publicar-painel
         for painel in paineis:
+            panel_id = int(painel['id'])
             try:
-                bot.add_view(PanelOnlyView(int(painel['id'])))
+                bot.add_view(PanelOnlyView(panel_id))
+                restored_panels += 1
             except Exception as e:
-                print('erro restaurando painel', painel['id'], e)
+                print('erro registrando view do painel', panel_id, e)
 
-        # Restaura botões de compra de produtos individuais criados com /criar-produto-canal-atual.
-        # Cada botão agora usa custom_id único: buy_product_<id>.
+            # Ponto principal da correção:
+            # busca a mensagem antiga do painel e aplica uma view nova nela.
+            try:
+                channel_id = painel['channel_id']
+                message_id = painel['message_id']
+                if channel_id and message_id:
+                    canal = bot.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
+                    msg = await canal.fetch_message(int(message_id))
+                    await msg.edit(embed=panel_embed(panel_id), view=PanelOnlyView(panel_id))
+                    republished_panels += 1
+                    print(f'Painel {panel_id} religado na mensagem {message_id}.')
+            except Exception as e:
+                print('Erro religando mensagem do painel:', panel_id, e)
+
+        # 2) Restaura produtos individuais criados com /criar-produto-canal-atual ou /republicar-produto
+        # Agora cada botão usa custom_id único: buy_product_<id>.
         for produto in produtos:
+            product_id = int(produto['id'])
             try:
-                bot.add_view(BuyView(product_id=int(produto['id'])))
+                bot.add_view(BuyView(product_id=product_id))
+                restored_products += 1
             except Exception as e:
-                print('erro restaurando produto', produto['id'], e)
+                print('erro registrando view do produto', product_id, e)
 
-        print(f'Views persistentes restauradas: {len(paineis)} painel(is) e {len(produtos)} produto(s)')
+            # Se o produto tiver message_id salvo, também religa a mensagem antiga do produto.
+            try:
+                if 'channel_id' in produto.keys() and 'message_id' in produto.keys():
+                    channel_id = produto['channel_id']
+                    message_id = produto['message_id']
+                    if channel_id and message_id:
+                        canal = bot.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
+                        msg = await canal.fetch_message(int(message_id))
+                        await msg.edit(embed=product_embed(produto), view=BuyView(product_id=product_id))
+                        republished_products += 1
+                        print(f'Produto {product_id} religado na mensagem {message_id}.')
+            except Exception as e:
+                print('Erro religando mensagem do produto:', product_id, e)
+
+        print(f'Views persistentes restauradas: {restored_panels} painel(is) e {restored_products} produto(s)')
+        print(f'Mensagens religadas: {republished_panels} painel(is) e {republished_products} produto(s)')
     except Exception as e:
-        print('Erro restaurando views persistentes:', e)
+        print('Erro restaurando/religando views persistentes:', e)
+        traceback.print_exc()
 
     for g in bot.guilds: ensure_config(g.id)
     try:
@@ -469,8 +511,9 @@ async def publicar_painel(interaction, painel_id:int, canal:Optional[discord.Tex
 @bot.tree.command(name='criar-produto-canal-atual', description='Cria produto único no canal atual')
 async def criar_produto_canal_atual(interaction, nome:str, preco:float, estoque:int, descricao:str, imagem:Optional[str]=None, banner:Optional[str]=None):
     if not await admin_only(interaction): return
-    con=db(); cur=con.cursor(); cur.execute('INSERT INTO products(guild_id,name,price,stock,description,image_url,banner_url) VALUES(?,?,?,?,?,?,?)',(interaction.guild.id,nome,preco,estoque,descricao,imagem or '',banner or '')); pid=cur.lastrowid; p=con.execute('SELECT * FROM products WHERE id=?',(pid,)).fetchone(); con.commit(); con.close()
-    await interaction.channel.send(embed=product_embed(p), view=BuyView(product_id=pid))
+    con=db(); cur=con.cursor(); cur.execute('INSERT INTO products(guild_id,name,price,stock,description,image_url,banner_url,channel_id) VALUES(?,?,?,?,?,?,?,?)',(interaction.guild.id,nome,preco,estoque,descricao,imagem or '',banner or '', interaction.channel.id)); pid=cur.lastrowid; p=con.execute('SELECT * FROM products WHERE id=?',(pid,)).fetchone(); con.commit(); con.close()
+    msg = await interaction.channel.send(embed=product_embed(p), view=BuyView(product_id=pid))
+    con=db(); con.execute('UPDATE products SET channel_id=?, message_id=? WHERE id=?',(interaction.channel.id, msg.id, pid)); con.commit(); con.close()
     await interaction.response.send_message('✅ Produto criado no canal atual.', ephemeral=True)
 
 @bot.tree.command(name='republicar-produto', description='Republica um produto salvo no banco com botão persistente')
@@ -481,7 +524,8 @@ async def republicar_produto(interaction, produto_id:int, canal:Optional[discord
     if not p:
         await interaction.response.send_message('❌ Produto não encontrado ou desativado.', ephemeral=True)
         return
-    await canal.send(embed=product_embed(p), view=BuyView(product_id=produto_id))
+    msg = await canal.send(embed=product_embed(p), view=BuyView(product_id=produto_id))
+    con=db(); con.execute('UPDATE products SET channel_id=?, message_id=? WHERE id=?',(canal.id, msg.id, produto_id)); con.commit(); con.close()
     await interaction.response.send_message(f'✅ Produto `{produto_id}` republicado em {canal.mention}.', ephemeral=True)
 
 @bot.tree.command(name='criar-produto-lista', description='Cria produto e adiciona em painel/lista')
