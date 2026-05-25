@@ -143,16 +143,28 @@ async def log(guild:discord.Guild, msg:str):
         except Exception: pass
 
 # ================= UI VENDAS =================
+class ProductBuyButton(discord.ui.Button):
+    def __init__(self, product_id:int):
+        super().__init__(
+            label='🛒 Comprar agora',
+            style=discord.ButtonStyle.green,
+            custom_id=f'buy_product_{int(product_id)}'
+        )
+        self.product_id = int(product_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        # Defer rápido evita “Esta interação falhou” quando o Replit acorda lento.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await start_order(interaction, self.product_id)
+
 class BuyView(discord.ui.View):
     def __init__(self, product_id:int=None, panel_id:int=None):
         super().__init__(timeout=None)
         self.product_id=product_id; self.panel_id=panel_id
-        if panel_id: self.add_item(PanelSelect(panel_id))
-
-    @discord.ui.button(label='🛒 Comprar agora', style=discord.ButtonStyle.green, custom_id='buy_single_product')
-    async def buy_btn(self, interaction:discord.Interaction, button:discord.ui.Button):
-        if self.product_id: await start_order(interaction, self.product_id)
-        else: await interaction.response.send_message('Selecione um produto no menu abaixo.', ephemeral=True)
+        if product_id:
+            self.add_item(ProductBuyButton(int(product_id)))
+        if panel_id:
+            self.add_item(PanelSelect(panel_id))
 
 class PanelOnlyView(discord.ui.View):
     def __init__(self, panel_id:int):
@@ -336,13 +348,24 @@ async def on_ready():
     try:
         con = db()
         paineis = con.execute('SELECT id FROM panels').fetchall()
+        produtos = con.execute('SELECT id FROM products WHERE active=1').fetchall()
         con.close()
+
         for painel in paineis:
             try:
                 bot.add_view(PanelOnlyView(int(painel['id'])))
             except Exception as e:
                 print('erro restaurando painel', painel['id'], e)
-        print(f'Views persistentes restauradas: {len(paineis)} painel(is)')
+
+        # Restaura botões de compra de produtos individuais criados com /criar-produto-canal-atual.
+        # Cada botão agora usa custom_id único: buy_product_<id>.
+        for produto in produtos:
+            try:
+                bot.add_view(BuyView(product_id=int(produto['id'])))
+            except Exception as e:
+                print('erro restaurando produto', produto['id'], e)
+
+        print(f'Views persistentes restauradas: {len(paineis)} painel(is) e {len(produtos)} produto(s)')
     except Exception as e:
         print('Erro restaurando views persistentes:', e)
 
@@ -450,11 +473,36 @@ async def criar_produto_canal_atual(interaction, nome:str, preco:float, estoque:
     await interaction.channel.send(embed=product_embed(p), view=BuyView(product_id=pid))
     await interaction.response.send_message('✅ Produto criado no canal atual.', ephemeral=True)
 
+@bot.tree.command(name='republicar-produto', description='Republica um produto salvo no banco com botão persistente')
+async def republicar_produto(interaction, produto_id:int, canal:Optional[discord.TextChannel]=None):
+    if not await admin_only(interaction): return
+    canal = canal or interaction.channel
+    con=db(); p=con.execute('SELECT * FROM products WHERE id=? AND active=1',(produto_id,)).fetchone(); con.close()
+    if not p:
+        await interaction.response.send_message('❌ Produto não encontrado ou desativado.', ephemeral=True)
+        return
+    await canal.send(embed=product_embed(p), view=BuyView(product_id=produto_id))
+    await interaction.response.send_message(f'✅ Produto `{produto_id}` republicado em {canal.mention}.', ephemeral=True)
+
 @bot.tree.command(name='criar-produto-lista', description='Cria produto e adiciona em painel/lista')
 async def criar_produto_lista(interaction, painel_id:int, nome:str, preco:float, estoque:int=-1, descricao:str='', imagem:Optional[str]=None, banner:Optional[str]=None):
     if not await admin_only(interaction): return
     con=db(); cur=con.cursor(); cur.execute('INSERT INTO products(guild_id,name,price,stock,description,image_url,banner_url) VALUES(?,?,?,?,?,?,?)',(interaction.guild.id,nome,preco,estoque,descricao,imagem or '',banner or '')); pid=cur.lastrowid; cur.execute('INSERT OR IGNORE INTO panel_products(panel_id,product_id) VALUES(?,?)',(painel_id,pid)); con.commit(); con.close()
     await interaction.response.send_message(f'✅ Produto `{nome}` adicionado ao painel `{painel_id}`.', ephemeral=True)
+
+@bot.tree.command(name='listar-produtos', description='Lista produtos salvos no banco')
+async def listar_produtos(interaction):
+    if not await admin_only(interaction): return
+    con=db(); rows=con.execute('SELECT id,name,price,stock,active FROM products WHERE guild_id=? ORDER BY id DESC LIMIT 25',(interaction.guild.id,)).fetchall(); con.close()
+    if not rows:
+        await interaction.response.send_message('📦 Nenhum produto salvo ainda.', ephemeral=True)
+        return
+    linhas=[]
+    for r in rows:
+        status='ativo' if r['active'] else 'desativado'
+        estoque='∞' if r['stock'] < 0 else str(r['stock'])
+        linhas.append(f'`{r["id"]}` • **{r["name"]}** • {money(r["price"])} • estoque {estoque} • {status}')
+    await interaction.response.send_message('📦 **Produtos salvos:**\n' + '\n'.join(linhas), ephemeral=True)
 
 @bot.tree.command(name='editar-produto', description='Edita produto')
 async def editar_produto(interaction, produto_id:int, nome:Optional[str]=None, preco:Optional[float]=None, estoque:Optional[int]=None, descricao:Optional[str]=None, imagem:Optional[str]=None, banner:Optional[str]=None):
@@ -550,7 +598,7 @@ async def criar_painel_captcha(interaction):
 
 class CaptchaView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
-    @discord.ui.button(label='✅ Verificar', style=discord.ButtonStyle.green)
+    @discord.ui.button(label='✅ Verificar', style=discord.ButtonStyle.green, custom_id='captcha_verify_v13')
     async def verify(self, interaction, button): await interaction.response.send_message('✅ Verificado.', ephemeral=True)
 
 @bot.tree.command(name='limpar', description='Apaga mensagens')
