@@ -1,5 +1,5 @@
 import os, sqlite3, asyncio, json, io, random, string, traceback, re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import discord
@@ -32,6 +32,7 @@ PIX_NOME = os.getenv('PIX_NOME','LOJA')[:25]
 PIX_CIDADE = os.getenv('PIX_CIDADE','SAO PAULO')[:15]
 WEBHOOK_URL = os.getenv('WEBHOOK_URL','')
 OWNER_IDS = [int(x) for x in os.getenv('OWNER_IDS','').replace(';',',').split(',') if x.strip().isdigit()]
+DEFAULT_TRIAL_DAYS = int(os.getenv('DEFAULT_TRIAL_DAYS','0'))
 TICKET_IMAGE_URL = os.getenv('TICKET_IMAGE_URL','')
 TICKET_THUMB_URL = os.getenv('TICKET_THUMB_URL','')
 TICKET_CATEGORY_NAME = os.getenv('TICKET_CATEGORY_NAME','tickets')
@@ -96,6 +97,22 @@ def init_db():
         amount REAL, status TEXT DEFAULT 'pendente', code TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )''')
     cur.execute('''CREATE TABLE IF NOT EXISTS reviews(id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER, user_id INTEGER, stars INTEGER, text TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS guild_subscriptions(
+        guild_id INTEGER PRIMARY KEY,
+        active INTEGER DEFAULT 0,
+        plan_name TEXT DEFAULT 'mensal',
+        expires_at TEXT,
+        activated_by INTEGER,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS guild_customization(
+        guild_id INTEGER PRIMARY KEY,
+        store_name TEXT DEFAULT 'Entregas automática',
+        color INTEGER DEFAULT 5793266,
+        bot_nickname TEXT DEFAULT '',
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
     # Migração segura para versões antigas do banco
     for col, typ in [
         ('image_url','TEXT DEFAULT ""'), ('banner_url','TEXT DEFAULT ""'), ('delivery_text','TEXT DEFAULT ""'),
@@ -116,6 +133,60 @@ def ensure_config(guild_id:int):
 def get_config(guild_id:int):
     ensure_config(guild_id)
     con=db(); row=con.execute('SELECT * FROM guild_config WHERE guild_id=?',(guild_id,)).fetchone(); con.close(); return row
+
+def now_iso():
+    return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+
+def parse_iso(dt):
+    if not dt: return None
+    try: return datetime.strptime(str(dt).split('.')[0].replace('T',' '), '%Y-%m-%d %H:%M:%S')
+    except Exception: return None
+
+def is_owner_user(user_id:int):
+    return int(user_id) in OWNER_IDS
+
+def get_subscription(guild_id:int):
+    con=db(); row=con.execute('SELECT * FROM guild_subscriptions WHERE guild_id=?',(guild_id,)).fetchone(); con.close(); return row
+
+def guild_has_plan(guild_id:int):
+    row=get_subscription(guild_id)
+    if not row or int(row['active'] or 0) != 1: return False
+    exp=parse_iso(row['expires_at'])
+    return exp is None or exp >= datetime.utcnow()
+
+def plan_text(guild_id:int):
+    row=get_subscription(guild_id)
+    if not row: return '❌ Sem plano ativo'
+    exp=row['expires_at'] or 'sem vencimento'
+    return f'✅ Plano **{row["plan_name"]}** ativo até `{exp}`' if guild_has_plan(guild_id) else f'❌ Plano expirado em `{exp}`'
+
+def get_customization(guild_id:int):
+    ensure_config(guild_id)
+    con=db(); cur=con.cursor()
+    cur.execute('INSERT OR IGNORE INTO guild_customization(guild_id,store_name,color) SELECT guild_id,store_name,color FROM guild_config WHERE guild_id=?',(guild_id,))
+    con.commit(); row=cur.execute('SELECT * FROM guild_customization WHERE guild_id=?',(guild_id,)).fetchone(); con.close(); return row
+
+def parse_color(value, default=0x5865F2):
+    if value is None: return default
+    try: return int(str(value).strip().replace('#','').replace('0x',''),16)
+    except Exception: return default
+
+async def require_active_plan(inter):
+    if not inter.guild: return True
+    if is_owner_user(inter.user.id): return True
+    if guild_has_plan(inter.guild.id): return True
+    await inter.response.send_message(f'🔒 Este servidor ainda não tem plano ativo.\n\nID do servidor: `{inter.guild.id}`\nPeça ao dono do bot para ativar com `/ativar-servidor`.', ephemeral=True)
+    return False
+
+async def protected_admin_only(inter):
+    if not await admin_only(inter): return False
+    return await require_active_plan(inter)
+
+async def owner_only(inter):
+    if not is_owner_user(inter.user.id):
+        await inter.response.send_message('❌ Apenas o dono do bot pode usar isso.', ephemeral=True)
+        return False
+    return True
 
 def is_admin(inter:discord.Interaction):
     return inter.user.guild_permissions.administrator or inter.user.id in OWNER_IDS
@@ -146,15 +217,9 @@ async def log(guild:discord.Guild, msg:str):
 # ================= UI VENDAS =================
 class ProductBuyButton(discord.ui.Button):
     def __init__(self, product_id:int):
-        super().__init__(
-            label='🛒 Comprar agora',
-            style=discord.ButtonStyle.green,
-            custom_id=f'buy_product_{int(product_id)}'
-        )
+        super().__init__(label='🛒 Comprar agora', style=discord.ButtonStyle.green, custom_id=f'buy_product_{int(product_id)}')
         self.product_id = int(product_id)
-
-    async def callback(self, interaction: discord.Interaction):
-        # Defer rápido evita “Esta interação falhou” quando o Replit acorda lento.
+    async def callback(self, interaction:discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         await start_order(interaction, self.product_id)
 
@@ -230,7 +295,12 @@ def product_embed(p):
     embed.add_field(name='⚡ Entrega', value='Automática após aprovação', inline=False)
     if valid_url(p['image_url']): embed.set_thumbnail(url=p['image_url'])
     if valid_url(p['banner_url']): embed.set_image(url=p['banner_url'])
-    embed.set_footer(text='Entregas automática • Hoje')
+
+    try:
+        cfg=get_customization(int(p['guild_id'])); loja = cfg['store_name'] or 'Entregas automática'
+    except Exception:
+        loja = 'Entregas automática'
+    embed.set_footer(text=f'{loja} • Hoje')
     return embed
 
 def panel_embed(panel_id:int):
@@ -238,10 +308,15 @@ def panel_embed(panel_id:int):
     if not panel:
         return discord.Embed(title='Painel não encontrado', color=0xff0000)
     # CORREÇÃO PEDIDA: NÃO mostra valores/planos dentro da descrição.
-    embed=discord.Embed(title=panel['title'] or panel['name'], description=(panel['description'] or '')[:4096], color=panel['color'] or 0x5865F2)
+
+    try:
+        custom=get_customization(int(panel['guild_id'])); loja=custom['store_name'] or 'Entregas automática'; cor=custom['color'] or panel['color'] or 0x5865F2
+    except Exception:
+        loja='Entregas automática'; cor=panel['color'] or 0x5865F2
+    embed=discord.Embed(title=panel['title'] or panel['name'], description=(panel['description'] or '')[:4096], color=cor)
     if valid_url(panel['image_url']): embed.set_thumbnail(url=panel['image_url'])
     if valid_url(panel['banner_url']): embed.set_image(url=panel['banner_url'])
-    embed.set_footer(text='Entregas automática • Painel de vendas')
+    embed.set_footer(text=f'{loja} • Painel de vendas')
     return embed
 
 # ================= MODALS PAINEL =================
@@ -337,79 +412,41 @@ async def criar_ticket(interaction: discord.Interaction, tipo: str):
     await ch.send(embed=embed, view=CloseTicketView())
     await interaction.followup.send(f'✅ Ticket criado: {ch.mention}', ephemeral=True)
 
+@bot.event
+async def on_guild_join(guild):
+    ensure_config(guild.id)
+    if DEFAULT_TRIAL_DAYS > 0:
+        expires = datetime.utcnow() + timedelta(days=DEFAULT_TRIAL_DAYS)
+        con=db(); con.execute("""INSERT INTO guild_subscriptions(guild_id,active,plan_name,expires_at,activated_by,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET active=1, plan_name=excluded.plan_name, expires_at=excluded.expires_at, updated_at=excluded.updated_at""", (guild.id,1,'trial',expires.strftime('%Y-%m-%d %H:%M:%S'),0,now_iso()))
+        con.commit(); con.close()
+
 # ================= COMMANDS =================
 @bot.event
 async def on_ready():
     init_db()
 
     # Persistent views: mantém botões/dropdowns funcionando após reiniciar o bot.
-    # Além de registrar as views, este bloco RELIGA as mensagens antigas com msg.edit(view=...).
+    # Isso restaura todos os painéis salvos no vendas.db.
     bot.add_view(TicketPanelView())
     bot.add_view(CloseTicketView())
-
-    restored_panels = 0
-    republished_panels = 0
-    restored_products = 0
-    republished_products = 0
-
     try:
         con = db()
         paineis = con.execute('SELECT * FROM panels').fetchall()
         produtos = con.execute('SELECT * FROM products WHERE active=1').fetchall()
         con.close()
-
-        # 1) Restaura e RELIGA painéis publicados com /publicar-painel
         for painel in paineis:
-            panel_id = int(painel['id'])
             try:
-                bot.add_view(PanelOnlyView(panel_id))
-                restored_panels += 1
+                bot.add_view(PanelOnlyView(int(painel['id'])))
             except Exception as e:
-                print('erro registrando view do painel', panel_id, e)
-
-            # Ponto principal da correção:
-            # busca a mensagem antiga do painel e aplica uma view nova nela.
-            try:
-                channel_id = painel['channel_id']
-                message_id = painel['message_id']
-                if channel_id and message_id:
-                    canal = bot.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
-                    msg = await canal.fetch_message(int(message_id))
-                    await msg.edit(embed=panel_embed(panel_id), view=PanelOnlyView(panel_id))
-                    republished_panels += 1
-                    print(f'Painel {panel_id} religado na mensagem {message_id}.')
-            except Exception as e:
-                print('Erro religando mensagem do painel:', panel_id, e)
-
-        # 2) Restaura produtos individuais criados com /criar-produto-canal-atual ou /republicar-produto
-        # Agora cada botão usa custom_id único: buy_product_<id>.
+                print('erro restaurando painel', painel['id'], e)
         for produto in produtos:
-            product_id = int(produto['id'])
             try:
-                bot.add_view(BuyView(product_id=product_id))
-                restored_products += 1
+                bot.add_view(BuyView(product_id=int(produto['id'])))
             except Exception as e:
-                print('erro registrando view do produto', product_id, e)
-
-            # Se o produto tiver message_id salvo, também religa a mensagem antiga do produto.
-            try:
-                if 'channel_id' in produto.keys() and 'message_id' in produto.keys():
-                    channel_id = produto['channel_id']
-                    message_id = produto['message_id']
-                    if channel_id and message_id:
-                        canal = bot.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
-                        msg = await canal.fetch_message(int(message_id))
-                        await msg.edit(embed=product_embed(produto), view=BuyView(product_id=product_id))
-                        republished_products += 1
-                        print(f'Produto {product_id} religado na mensagem {message_id}.')
-            except Exception as e:
-                print('Erro religando mensagem do produto:', product_id, e)
-
-        print(f'Views persistentes restauradas: {restored_panels} painel(is) e {restored_products} produto(s)')
-        print(f'Mensagens religadas: {republished_panels} painel(is) e {republished_products} produto(s)')
+                print('erro restaurando produto', produto['id'], e)
+        print(f'Views persistentes restauradas: {len(paineis)} painel(is) e {len(produtos)} produto(s)')
     except Exception as e:
-        print('Erro restaurando/religando views persistentes:', e)
-        traceback.print_exc()
+        print('Erro restaurando views persistentes:', e)
 
     for g in bot.guilds: ensure_config(g.id)
     try:
@@ -424,9 +461,62 @@ async def on_ready():
         print(f'Comandos globais: {len(global_synced)} | comandos em servidores: {total}')
     except Exception as e: print('Erro sync:', e)
 
+@bot.tree.command(name='meu-plano', description='Mostra o plano deste servidor')
+async def meu_plano(interaction:discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message('Use este comando dentro de um servidor.', ephemeral=True); return
+    await interaction.response.send_message(f'📌 Servidor: **{interaction.guild.name}**\n🆔 ID: `{interaction.guild.id}`\n{plan_text(interaction.guild.id)}', ephemeral=True)
+
+@bot.tree.command(name='ativar-servidor', description='Ativa plano para um servidor pelo ID')
+@app_commands.describe(servidor_id='ID do servidor', dias='Dias de acesso', plano='Nome do plano')
+async def ativar_servidor(interaction:discord.Interaction, servidor_id:str, dias:int=30, plano:str='mensal'):
+    if not await owner_only(interaction): return
+    try: gid=int(servidor_id)
+    except Exception:
+        await interaction.response.send_message('❌ ID inválido.', ephemeral=True); return
+    expires = datetime.utcnow() + timedelta(days=max(1,dias))
+    con=db(); con.execute("""INSERT INTO guild_subscriptions(guild_id,active,plan_name,expires_at,activated_by,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET active=1, plan_name=excluded.plan_name, expires_at=excluded.expires_at, activated_by=excluded.activated_by, updated_at=excluded.updated_at""", (gid,1,plano,expires.strftime('%Y-%m-%d %H:%M:%S'),interaction.user.id,now_iso()))
+    con.commit(); con.close()
+    await interaction.response.send_message(f'✅ Servidor `{gid}` ativado por **{dias} dias** no plano **{plano}**.\nVence em `{expires.strftime("%Y-%m-%d %H:%M:%S")}`.', ephemeral=True)
+
+@bot.tree.command(name='desativar-servidor', description='Desativa plano de um servidor pelo ID')
+async def desativar_servidor(interaction:discord.Interaction, servidor_id:str):
+    if not await owner_only(interaction): return
+    try: gid=int(servidor_id)
+    except Exception:
+        await interaction.response.send_message('❌ ID inválido.', ephemeral=True); return
+    con=db(); con.execute('UPDATE guild_subscriptions SET active=0, updated_at=? WHERE guild_id=?',(now_iso(),gid)); con.commit(); con.close()
+    await interaction.response.send_message(f'✅ Servidor `{gid}` desativado.', ephemeral=True)
+
+@bot.tree.command(name='personalizar-loja', description='Personaliza loja, cor e nickname do bot neste servidor')
+@app_commands.describe(nome='Nome da loja', cor_hex='Cor HEX. Ex: ff00aa', nickname_bot='Nome do bot neste servidor')
+async def personalizar_loja(interaction:discord.Interaction, nome:Optional[str]=None, cor_hex:Optional[str]=None, nickname_bot:Optional[str]=None):
+    if not await protected_admin_only(interaction): return
+    cfg=get_customization(interaction.guild.id)
+    nome_final=nome or cfg['store_name'] or 'Entregas automática'
+    cor_final=parse_color(cor_hex, cfg['color'] or 0x5865F2)
+    nick_final=nickname_bot if nickname_bot is not None else (cfg['bot_nickname'] or '')
+    con=db(); con.execute("""INSERT INTO guild_customization(guild_id,store_name,color,bot_nickname,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET store_name=excluded.store_name, color=excluded.color, bot_nickname=excluded.bot_nickname, updated_at=excluded.updated_at""", (interaction.guild.id,nome_final,cor_final,nick_final,now_iso()))
+    con.execute('UPDATE guild_config SET store_name=?, color=? WHERE guild_id=?',(nome_final,cor_final,interaction.guild.id)); con.commit(); con.close()
+    msg=f'✅ Loja personalizada.\nNome: **{nome_final}**\nCor: `#{cor_final:06x}`'
+    if nickname_bot:
+        try:
+            await interaction.guild.me.edit(nick=nickname_bot[:32]); msg += f'\nNickname do bot alterado para **{nickname_bot[:32]}**.'
+        except Exception as e: msg += f'\n⚠️ Não consegui alterar o nickname: `{e}`'
+    await interaction.response.send_message(msg, ephemeral=True)
+
+@bot.tree.command(name='listar-servidores', description='Lista servidores onde o bot está e status do plano')
+async def listar_servidores(interaction:discord.Interaction):
+    if not await owner_only(interaction): return
+    linhas=[]
+    for g in bot.guilds[:25]:
+        status='ativo' if guild_has_plan(g.id) else 'bloqueado/expirado'
+        linhas.append(f'`{g.id}` • **{g.name}** • {status}')
+    await interaction.response.send_message('\n'.join(linhas) if linhas else 'Nenhum servidor encontrado.', ephemeral=True)
+
 @bot.tree.command(name='sincronizar', description='Força sincronização dos slash commands')
 async def sincronizar(interaction:discord.Interaction):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     await bot.tree.sync(); bot.tree.copy_global_to(guild=interaction.guild); cmds=await bot.tree.sync(guild=interaction.guild)
     await interaction.response.send_message(f'✅ Comandos sincronizados: {len(cmds)}. Aperte Ctrl+R no Discord.', ephemeral=True)
 
@@ -435,7 +525,7 @@ async def ping(interaction): await interaction.response.send_message(f'🏓 Pong
 
 @bot.tree.command(name='configurar', description='Cria estrutura inicial do bot')
 async def configurar(interaction):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     guild=interaction.guild; ensure_config(guild.id)
     cat=await guild.create_category('🛒 Loja / Vendas')
     painel=await guild.create_text_channel('🛒・seu-painel', category=cat)
@@ -448,7 +538,7 @@ async def configurar(interaction):
 @bot.tree.command(name='autenticacao', description='Configura Pix, Mercado Pago, EFI e webhook')
 @app_commands.describe(pix_key='Chave PIX', pix_nome='Nome recebedor', pix_cidade='Cidade', mercado_pago_token='Access token MP', webhook='Webhook de logs')
 async def autenticacao(interaction, pix_key:Optional[str]=None, pix_nome:Optional[str]=None, pix_cidade:Optional[str]=None, mercado_pago_token:Optional[str]=None, webhook:Optional[str]=None):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     ensure_config(interaction.guild.id)
     con=db(); cfg=get_config(interaction.guild.id)
     con.execute('UPDATE guild_config SET pix_key=?, pix_name=?, pix_city=?, mp_token=?, webhook_url=? WHERE guild_id=?', (pix_key or cfg['pix_key'], pix_nome or cfg['pix_name'], pix_cidade or cfg['pix_city'], mercado_pago_token or cfg['mp_token'], webhook or cfg['webhook_url'], interaction.guild.id)); con.commit(); con.close()
@@ -456,7 +546,7 @@ async def autenticacao(interaction, pix_key:Optional[str]=None, pix_nome:Optiona
 
 @bot.tree.command(name='webhook', description='Cadastra webhook para logs')
 async def webhook(interaction, url:str):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     con=db(); ensure_config(interaction.guild.id); con.execute('UPDATE guild_config SET webhook_url=? WHERE guild_id=?',(url,interaction.guild.id)); con.commit(); con.close()
     await interaction.response.send_message('✅ Webhook salvo.', ephemeral=True)
 
@@ -470,7 +560,7 @@ async def cargo_id(interaction, cargo:discord.Role): await interaction.response.
 
 @bot.tree.command(name='canal-de-avaliacoes', description='Seleciona canal para avaliações')
 async def canal_de_avaliacoes(interaction, canal:discord.TextChannel):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     ensure_config(interaction.guild.id); con=db(); con.execute('UPDATE guild_config SET review_channel_id=? WHERE guild_id=?',(canal.id, interaction.guild.id)); con.commit(); con.close()
     await interaction.response.send_message(f'✅ Canal de avaliações: {canal.mention}', ephemeral=True)
 
@@ -484,7 +574,7 @@ async def avaliacoes_servidor(interaction):
 @bot.tree.command(name='criar-painel-config', description='Abre tópico/painel para configurar produto por botões')
 @app_commands.describe(nome='Nome interno do painel')
 async def criar_painel_config(interaction, nome:str):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     con=db(); cur=con.cursor(); cur.execute('INSERT INTO panels(guild_id,name,title,description,channel_id) VALUES(?,?,?,?,?)',(interaction.guild.id,nome,nome,'Configure a descrição deste painel clicando nos botões abaixo.', interaction.channel.id)); panel_id=cur.lastrowid; con.commit(); con.close()
     await interaction.response.send_message(f'✅ Painel criado. ID `{panel_id}`', ephemeral=True)
     msg=await interaction.channel.send(f'⚙️ Configuração do painel **{nome}**\nID: `{panel_id}`', view=ConfigPanelView(panel_id))
@@ -496,13 +586,13 @@ async def criar_painel_config(interaction, nome:str):
 
 @bot.tree.command(name='adicionar-plano', description='Adiciona plano/produto a um painel existente')
 async def adicionar_plano(interaction, painel_id:int, nome:str, preco:float, estoque:int=-1, descricao:str=''):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     con=db(); cur=con.cursor(); cur.execute('INSERT INTO products(guild_id,name,price,stock,description,category,delivery_text) VALUES(?,?,?,?,?,?,?)',(interaction.guild.id,nome,preco,estoque,descricao,'Painel',descricao)); pid=cur.lastrowid; cur.execute('INSERT OR IGNORE INTO panel_products(panel_id,product_id) VALUES(?,?)',(painel_id,pid)); con.commit(); con.close()
     await interaction.response.send_message(f'✅ Plano `{nome}` adicionado ao painel `{painel_id}`.', ephemeral=True)
 
 @bot.tree.command(name='publicar-painel', description='Publica painel de produtos no canal')
 async def publicar_painel(interaction, painel_id:int, canal:Optional[discord.TextChannel]=None):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     canal=canal or interaction.channel
     msg=await canal.send(embed=panel_embed(painel_id), view=PanelOnlyView(painel_id))
     con=db(); con.execute('UPDATE panels SET channel_id=?,message_id=? WHERE id=?',(canal.id,msg.id,painel_id)); con.commit(); con.close()
@@ -510,47 +600,21 @@ async def publicar_painel(interaction, painel_id:int, canal:Optional[discord.Tex
 
 @bot.tree.command(name='criar-produto-canal-atual', description='Cria produto único no canal atual')
 async def criar_produto_canal_atual(interaction, nome:str, preco:float, estoque:int, descricao:str, imagem:Optional[str]=None, banner:Optional[str]=None):
-    if not await admin_only(interaction): return
-    con=db(); cur=con.cursor(); cur.execute('INSERT INTO products(guild_id,name,price,stock,description,image_url,banner_url,channel_id) VALUES(?,?,?,?,?,?,?,?)',(interaction.guild.id,nome,preco,estoque,descricao,imagem or '',banner or '', interaction.channel.id)); pid=cur.lastrowid; p=con.execute('SELECT * FROM products WHERE id=?',(pid,)).fetchone(); con.commit(); con.close()
+    if not await protected_admin_only(interaction): return
+    con=db(); cur=con.cursor(); cur.execute('INSERT INTO products(guild_id,name,price,stock,description,image_url,banner_url,channel_id) VALUES(?,?,?,?,?,?,?,?)',(interaction.guild.id,nome,preco,estoque,descricao,imagem or '',banner or '',interaction.channel.id)); pid=cur.lastrowid; p=con.execute('SELECT * FROM products WHERE id=?',(pid,)).fetchone(); con.commit(); con.close()
     msg = await interaction.channel.send(embed=product_embed(p), view=BuyView(product_id=pid))
-    con=db(); con.execute('UPDATE products SET channel_id=?, message_id=? WHERE id=?',(interaction.channel.id, msg.id, pid)); con.commit(); con.close()
+    con=db(); con.execute('UPDATE products SET message_id=? WHERE id=?',(msg.id,pid)); con.commit(); con.close()
     await interaction.response.send_message('✅ Produto criado no canal atual.', ephemeral=True)
-
-@bot.tree.command(name='republicar-produto', description='Republica um produto salvo no banco com botão persistente')
-async def republicar_produto(interaction, produto_id:int, canal:Optional[discord.TextChannel]=None):
-    if not await admin_only(interaction): return
-    canal = canal or interaction.channel
-    con=db(); p=con.execute('SELECT * FROM products WHERE id=? AND active=1',(produto_id,)).fetchone(); con.close()
-    if not p:
-        await interaction.response.send_message('❌ Produto não encontrado ou desativado.', ephemeral=True)
-        return
-    msg = await canal.send(embed=product_embed(p), view=BuyView(product_id=produto_id))
-    con=db(); con.execute('UPDATE products SET channel_id=?, message_id=? WHERE id=?',(canal.id, msg.id, produto_id)); con.commit(); con.close()
-    await interaction.response.send_message(f'✅ Produto `{produto_id}` republicado em {canal.mention}.', ephemeral=True)
 
 @bot.tree.command(name='criar-produto-lista', description='Cria produto e adiciona em painel/lista')
 async def criar_produto_lista(interaction, painel_id:int, nome:str, preco:float, estoque:int=-1, descricao:str='', imagem:Optional[str]=None, banner:Optional[str]=None):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     con=db(); cur=con.cursor(); cur.execute('INSERT INTO products(guild_id,name,price,stock,description,image_url,banner_url) VALUES(?,?,?,?,?,?,?)',(interaction.guild.id,nome,preco,estoque,descricao,imagem or '',banner or '')); pid=cur.lastrowid; cur.execute('INSERT OR IGNORE INTO panel_products(panel_id,product_id) VALUES(?,?)',(painel_id,pid)); con.commit(); con.close()
     await interaction.response.send_message(f'✅ Produto `{nome}` adicionado ao painel `{painel_id}`.', ephemeral=True)
 
-@bot.tree.command(name='listar-produtos', description='Lista produtos salvos no banco')
-async def listar_produtos(interaction):
-    if not await admin_only(interaction): return
-    con=db(); rows=con.execute('SELECT id,name,price,stock,active FROM products WHERE guild_id=? ORDER BY id DESC LIMIT 25',(interaction.guild.id,)).fetchall(); con.close()
-    if not rows:
-        await interaction.response.send_message('📦 Nenhum produto salvo ainda.', ephemeral=True)
-        return
-    linhas=[]
-    for r in rows:
-        status='ativo' if r['active'] else 'desativado'
-        estoque='∞' if r['stock'] < 0 else str(r['stock'])
-        linhas.append(f'`{r["id"]}` • **{r["name"]}** • {money(r["price"])} • estoque {estoque} • {status}')
-    await interaction.response.send_message('📦 **Produtos salvos:**\n' + '\n'.join(linhas), ephemeral=True)
-
 @bot.tree.command(name='editar-produto', description='Edita produto')
 async def editar_produto(interaction, produto_id:int, nome:Optional[str]=None, preco:Optional[float]=None, estoque:Optional[int]=None, descricao:Optional[str]=None, imagem:Optional[str]=None, banner:Optional[str]=None):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     con=db(); p=con.execute('SELECT * FROM products WHERE id=?',(produto_id,)).fetchone()
     if not p: con.close(); await interaction.response.send_message('❌ Produto não encontrado.', ephemeral=True); return
     con.execute('UPDATE products SET name=?,price=?,stock=?,description=?,image_url=?,banner_url=? WHERE id=?',(nome or p['name'], preco if preco is not None else p['price'], estoque if estoque is not None else p['stock'], descricao if descricao is not None else p['description'], imagem if imagem is not None else p['image_url'], banner if banner is not None else p['banner_url'], produto_id)); con.commit(); con.close()
@@ -558,12 +622,13 @@ async def editar_produto(interaction, produto_id:int, nome:Optional[str]=None, p
 
 @bot.tree.command(name='remover-produto', description='Desativa produto')
 async def remover_produto(interaction, produto_id:int):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     con=db(); con.execute('UPDATE products SET active=0 WHERE id=?',(produto_id,)); con.commit(); con.close()
     await interaction.response.send_message('✅ Produto removido/desativado.', ephemeral=True)
 
 @bot.tree.command(name='cobrar', description='Cria cobrança PIX personalizada')
 async def cobrar(interaction, valor:float, descricao:str='Cobrança personalizada'):
+    if not await protected_admin_only(interaction): return
     code=random_code(); cfg=get_config(interaction.guild.id); key=cfg['pix_key'] or PIX_KEY
     if not key: await interaction.response.send_message('❌ Configure PIX primeiro.', ephemeral=True); return
     payload=pix_payload(key,cfg['pix_name'] or PIX_NOME,cfg['pix_city'] or PIX_CIDADE,valor,code)
@@ -609,7 +674,7 @@ async def desconectar(interaction):
 @bot.tree.command(name='painel-ticket', description='Envia painel de ticket com imagem opcional')
 @app_commands.describe(titulo='Título do painel', descricao='Descrição do painel', imagem='URL da imagem/banner')
 async def painel_ticket(interaction, titulo:Optional[str]=None, descricao:Optional[str]=None, imagem:Optional[str]=None):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     await interaction.response.defer(ephemeral=True)
     embed = ticket_panel_embed(titulo, descricao, imagem)
     await interaction.channel.send(embed=embed, view=TicketPanelView())
@@ -617,69 +682,69 @@ async def painel_ticket(interaction, titulo:Optional[str]=None, descricao:Option
 
 @bot.tree.command(name='criar-tickets-modo-canais', description='Cria painel de ticket por canais')
 async def criar_tickets_modo_canais(interaction):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     await interaction.response.defer(ephemeral=True)
     await interaction.channel.send(embed=ticket_panel_embed(), view=TicketPanelView())
     await interaction.followup.send('✅ Painel de ticket enviado.', ephemeral=True)
 
 @bot.tree.command(name='criar-tickets-modo-topico', description='Cria painel de ticket por tópico')
 async def criar_tickets_modo_topico(interaction):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     await interaction.response.defer(ephemeral=True)
     await interaction.channel.send(embed=ticket_panel_embed(), view=TicketPanelView())
     await interaction.followup.send('✅ Painel de ticket enviado.', ephemeral=True)
 
 @bot.tree.command(name='criar-categoria', description='Cria categoria da loja')
 async def criar_categoria(interaction, nome:str):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     cat=await interaction.guild.create_category(nome); await interaction.response.send_message(f'✅ Categoria criada: `{cat.name}`', ephemeral=True)
 
 @bot.tree.command(name='criar-painel-captcha', description='Cria painel simples de captcha/verificação')
 async def criar_painel_captcha(interaction):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     await interaction.channel.send(embed=discord.Embed(title='✅ Verificação', description='Clique para liberar acesso.', color=0x00ff99), view=CaptchaView())
     await interaction.response.send_message('✅ Painel captcha enviado.', ephemeral=True)
 
 class CaptchaView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
-    @discord.ui.button(label='✅ Verificar', style=discord.ButtonStyle.green, custom_id='captcha_verify_v13')
+    @discord.ui.button(label='✅ Verificar', style=discord.ButtonStyle.green)
     async def verify(self, interaction, button): await interaction.response.send_message('✅ Verificado.', ephemeral=True)
 
 @bot.tree.command(name='limpar', description='Apaga mensagens')
 async def limpar(interaction, quantidade:int):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     await interaction.response.defer(ephemeral=True); deleted=await interaction.channel.purge(limit=min(quantidade,100)); await interaction.followup.send(f'✅ Apaguei {len(deleted)} mensagens.', ephemeral=True)
 
 @bot.tree.command(name='enviar-mensagem-servidor', description='Envia mensagem em canal selecionado')
 async def enviar_mensagem_servidor(interaction, canal:discord.TextChannel, mensagem:str):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     await canal.send(mensagem); await interaction.response.send_message('✅ Mensagem enviada.', ephemeral=True)
 
 @bot.tree.command(name='enviar-mensagem-dm', description='Envia DM para usuário')
 async def enviar_mensagem_dm(interaction, usuario:discord.Member, mensagem:str):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     try: await usuario.send(mensagem); await interaction.response.send_message('✅ DM enviada.', ephemeral=True)
     except Exception as e: await interaction.response.send_message(f'❌ Erro: `{e}`', ephemeral=True)
 
 @bot.tree.command(name='status-adicionar', description='Adiciona status/atividade no bot')
 async def status_adicionar(interaction, texto:str):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     await bot.change_presence(activity=discord.Game(name=texto)); await interaction.response.send_message('✅ Status alterado.', ephemeral=True)
 
 @bot.tree.command(name='status-remover', description='Remove status do bot')
 async def status_remover(interaction):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     await bot.change_presence(activity=None); await interaction.response.send_message('✅ Status removido.', ephemeral=True)
 
 @bot.tree.command(name='desbloquear', description='Desbloqueia comandos no canal atual')
 async def desbloquear(interaction):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     await interaction.channel.set_permissions(interaction.guild.default_role, send_messages=True)
     await interaction.response.send_message('✅ Canal desbloqueado.', ephemeral=True)
 
 @bot.tree.command(name='restaurar-servidor', description='Restaura dados básicos do servidor no banco')
 async def restaurar_servidor(interaction):
-    if not await admin_only(interaction): return
+    if not await protected_admin_only(interaction): return
     ensure_config(interaction.guild.id); await interaction.response.send_message('✅ Dados restaurados/sincronizados no banco.', ephemeral=True)
 
 
