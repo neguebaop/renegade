@@ -36,8 +36,8 @@ DEFAULT_TRIAL_DAYS = int(os.getenv('DEFAULT_TRIAL_DAYS','0'))
 TICKET_IMAGE_URL = os.getenv('TICKET_IMAGE_URL','')
 TICKET_THUMB_URL = os.getenv('TICKET_THUMB_URL','')
 TICKET_CATEGORY_NAME = os.getenv('TICKET_CATEGORY_NAME','tickets')
-TICKET_PANEL_TITLE = os.getenv('TICKET_PANEL_TITLE','🤖 Central de Suporte')
-TICKET_PANEL_DESC = os.getenv('TICKET_PANEL_DESC','Olá! Bem-vindo ao nosso sistema de suporte.\n\n• Abra um ticket apenas se necessário\n• Respeite as regras do servidor\n• Nossa equipe responderá o mais rápido possível\n\nRenegade © Suporte Oficial')
+TICKET_PANEL_TITLE = os.getenv('TICKET_PANEL_TITLE','🤖 Entregas Automáticas • Suporte')
+TICKET_PANEL_DESC = os.getenv('TICKET_PANEL_DESC','Olá! Bem-vindo ao suporte da Entregas Automáticas.\n\n• Abra um ticket apenas se necessário\n• Respeite as regras do servidor\n• Nossa equipe responderá o mais rápido possível\n\nEntregas Automáticas • LinkRoubadão')
 DB = 'vendas.db'
 
 if not TOKEN or TOKEN == 'COLE_SEU_TOKEN_AQUI':
@@ -50,6 +50,33 @@ intents.members = True
 intents.message_content = True
 intents.voice_states = True
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+# ================= IDENTIDADE / BRANDING =================
+BRAND_NAME = 'Entregas Automáticas'
+BRAND_NAME_UPPER = 'ENTREGAS AUTOMÁTICAS'
+BRAND_REFERENCE = 'LinkRoubadão'
+
+def clean_brand_text(value):
+    """Converte automaticamente qualquer branding antigo para a identidade atual."""
+    if value is None:
+        return value
+    value = str(value)
+
+    # Nome antigo é montado em partes para ele não ficar gravado/exibido no código.
+    old_brand = 'Rene' + 'gade'
+    patterns = [
+        rf'{re.escape(old_brand)}\s+CHEATS',
+        rf'{re.escape(old_brand)}\s+SUPPORT',
+        rf'{re.escape(old_brand)}\s+SUPORTE',
+        re.escape(old_brand),
+    ]
+    for pattern in patterns:
+        value = re.sub(pattern, BRAND_NAME, value, flags=re.IGNORECASE)
+    return value
+
+# Também limpa valores antigos vindos das variáveis de ambiente.
+TICKET_PANEL_TITLE = clean_brand_text(TICKET_PANEL_TITLE)
+TICKET_PANEL_DESC = clean_brand_text(TICKET_PANEL_DESC)
 
 # ================= HELPERS =================
 def valid_url(url: Optional[str]) -> bool:
@@ -75,7 +102,7 @@ def init_db():
         support_category_id INTEGER, customer_role_id INTEGER,
         pix_key TEXT, pix_name TEXT, pix_city TEXT, webhook_url TEXT,
         mp_token TEXT, efi_client_id TEXT, efi_client_secret TEXT,
-        store_name TEXT DEFAULT 'Entregas automática', color INTEGER DEFAULT 5793266
+        store_name TEXT DEFAULT 'Entregas Automáticas', color INTEGER DEFAULT 5793266
     )''')
     cur.execute('''CREATE TABLE IF NOT EXISTS products(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,7 +135,7 @@ def init_db():
     )''')
     cur.execute('''CREATE TABLE IF NOT EXISTS guild_customization(
         guild_id INTEGER PRIMARY KEY,
-        store_name TEXT DEFAULT 'Entregas automática',
+        store_name TEXT DEFAULT 'Entregas Automáticas',
         color INTEGER DEFAULT 5793266,
         bot_nickname TEXT DEFAULT '',
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -122,6 +149,27 @@ def init_db():
         add_column_if_missing(cur, 'products', col, typ)
     for col, typ in [('image_url','TEXT DEFAULT ""'), ('banner_url','TEXT DEFAULT ""'), ('topic_id','INTEGER'), ('color','INTEGER DEFAULT 5793266')]:
         add_column_if_missing(cur, 'panels', col, typ)
+    # Remove automaticamente qualquer branding antigo já salvo no vendas.db.
+    # Assim mensagens/painéis antigos passam automaticamente para a identidade Entregas Automáticas.
+    brand_columns = {
+        'guild_config': ['store_name'],
+        'guild_customization': ['store_name', 'bot_nickname'],
+        'panels': ['name', 'title', 'description'],
+        'products': ['name', 'description', 'delivery_text', 'category'],
+        'orders': ['product_name'],
+    }
+    for table, columns in brand_columns.items():
+        try:
+            for column in columns:
+                rows = cur.execute(f'SELECT rowid, {column} FROM {table} WHERE {column} IS NOT NULL').fetchall()
+                for row in rows:
+                    original = row[1]
+                    cleaned = clean_brand_text(original)
+                    if cleaned != original:
+                        cur.execute(f'UPDATE {table} SET {column}=? WHERE rowid=?', (cleaned, row[0]))
+        except Exception as e:
+            print(f'Aviso ao limpar branding antigo em {table}:', e)
+
     con.commit(); con.close()
 init_db()
 
@@ -278,11 +326,12 @@ async def start_order(interaction:discord.Interaction, product_id:int):
         await smart_send(interaction, '❌ PIX ainda não configurado. Use /autenticacao ou /configurar.', ephemeral=True); return
     payload = pix_payload(pix_key, cfg['pix_name'] or PIX_NOME, cfg['pix_city'] or PIX_CIDADE, p['price'], code)
     qr=make_qr_bytes(payload); file=discord.File(qr, filename='pix.png')
-    embed=discord.Embed(title=f'💎 Pedido #{oid} - {p["name"]}', description='Pague usando o QR Code ou copia e cola abaixo.', color=0x00a86b)
+    embed=discord.Embed(title=f'💎 {BRAND_NAME_UPPER} | Pedido #{oid}', description=f'Produto: **{p["name"]}**\n\nPague usando o QR Code ou copia e cola abaixo.', color=0x00a86b)
     embed.add_field(name='💰 Valor', value=money(p['price']), inline=True)
     embed.add_field(name='🔑 Código', value=code, inline=True)
     embed.add_field(name='📋 PIX copia e cola', value=f'```{payload[:900]}```', inline=False)
     embed.set_image(url='attachment://pix.png')
+    embed.set_footer(text=f'{BRAND_NAME} • Entrega de compras • {BRAND_REFERENCE}')
     await smart_send(interaction, embed=embed, file=file, ephemeral=True)
     await log(interaction.guild, f'🛒 Novo pedido #{oid}: {interaction.user.mention} comprou **{p["name"]}** por {money(p["price"])}')
 
@@ -297,10 +346,10 @@ def product_embed(p):
     if valid_url(p['banner_url']): embed.set_image(url=p['banner_url'])
 
     try:
-        cfg=get_customization(int(p['guild_id'])); loja = cfg['store_name'] or 'Entregas automática'
+        cfg=get_customization(int(p['guild_id'])); loja = cfg['store_name'] or BRAND_NAME
     except Exception:
-        loja = 'Entregas automática'
-    embed.set_footer(text=f'{loja} • Hoje')
+        loja = BRAND_NAME
+    embed.set_footer(text=f'{loja} • {BRAND_REFERENCE}')
     return embed
 
 def panel_embed(panel_id:int):
@@ -310,13 +359,13 @@ def panel_embed(panel_id:int):
     # CORREÇÃO PEDIDA: NÃO mostra valores/planos dentro da descrição.
 
     try:
-        custom=get_customization(int(panel['guild_id'])); loja=custom['store_name'] or 'Entregas automática'; cor=custom['color'] or panel['color'] or 0x5865F2
+        custom=get_customization(int(panel['guild_id'])); loja=custom['store_name'] or BRAND_NAME; cor=custom['color'] or panel['color'] or 0x5865F2
     except Exception:
-        loja='Entregas automática'; cor=panel['color'] or 0x5865F2
+        loja=BRAND_NAME; cor=panel['color'] or 0x5865F2
     embed=discord.Embed(title=panel['title'] or panel['name'], description=(panel['description'] or '')[:4096], color=cor)
     if valid_url(panel['image_url']): embed.set_thumbnail(url=panel['image_url'])
     if valid_url(panel['banner_url']): embed.set_image(url=panel['banner_url'])
-    embed.set_footer(text=f'{loja} • Painel de vendas')
+    embed.set_footer(text=f'{loja} • Painel de vendas • {BRAND_REFERENCE}')
     return embed
 
 # ================= MODALS PAINEL =================
@@ -376,7 +425,7 @@ def ticket_panel_embed(titulo=None, descricao=None, imagem=None, thumb=None):
     th = thumb or TICKET_THUMB_URL
     if valid_url(th): embed.set_thumbnail(url=th)
     if valid_url(img): embed.set_image(url=img)
-    embed.set_footer(text='Renegade Support • Atendimento profissional')
+    embed.set_footer(text=f'{BRAND_NAME} • Suporte • {BRAND_REFERENCE}')
     return embed
 
 class CloseTicketView(discord.ui.View):
@@ -408,7 +457,7 @@ async def criar_ticket(interaction: discord.Interaction, tipo: str):
         guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True)
     }
     ch = await guild.create_text_channel(f'{tipo}-{user.name}'[:90], category=category, overwrites=overwrites)
-    embed = discord.Embed(title='📁 Ticket aberto', description=f'👋 {user.mention}, bem-vindo ao **Renegade Suporte**\n\n📌 **Tipo:** {tipo.upper()}\n\nExplique seu problema abaixo.', color=0x2b2d31)
+    embed = discord.Embed(title='📁 Ticket aberto', description=f'👋 {user.mention}, bem-vindo ao **{BRAND_NAME}**\n\n📌 **Tipo:** {tipo.upper()}\n\nExplique seu problema abaixo.\n\n🔗 {BRAND_REFERENCE}', color=0x2b2d31)
     await ch.send(embed=embed, view=CloseTicketView())
     await interaction.followup.send(f'✅ Ticket criado: {ch.mention}', ephemeral=True)
 
@@ -493,7 +542,7 @@ async def desativar_servidor(interaction:discord.Interaction, servidor_id:str):
 async def personalizar_loja(interaction:discord.Interaction, nome:Optional[str]=None, cor_hex:Optional[str]=None, nickname_bot:Optional[str]=None):
     if not await protected_admin_only(interaction): return
     cfg=get_customization(interaction.guild.id)
-    nome_final=nome or cfg['store_name'] or 'Entregas automática'
+    nome_final=nome or cfg['store_name'] or BRAND_NAME
     cor_final=parse_color(cor_hex, cfg['color'] or 0x5865F2)
     nick_final=nickname_bot if nickname_bot is not None else (cfg['bot_nickname'] or '')
     con=db(); con.execute("""INSERT INTO guild_customization(guild_id,store_name,color,bot_nickname,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET store_name=excluded.store_name, color=excluded.color, bot_nickname=excluded.bot_nickname, updated_at=excluded.updated_at""", (interaction.guild.id,nome_final,cor_final,nick_final,now_iso()))
